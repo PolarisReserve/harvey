@@ -1079,10 +1079,10 @@ async def get_outbox_api():
             **_compliance_view(),
             "paused": await state.get_setting("sending_paused"),
             "pending": await _with_context(
-                await state.get_outbox(status="pending_review", limit=100)),
-            # Mail going out right now leads the list.
-            "approved": (await state.get_outbox(status="sending", limit=10)
-                         + await state.get_outbox(status="approved", limit=50)),
+                await state.get_outbox(status="pending_review", limit=100, channel=None)),
+            # Mail going out right now leads the list. Texts are listed too.
+            "approved": (await state.get_outbox(status="sending", limit=10, channel=None)
+                         + await state.get_outbox(status="approved", limit=50, channel=None)),
             "sent": (await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
@@ -1189,12 +1189,17 @@ async def outbox_edit(item_id: str, request: Request):
             return JSONResponse({"success": False,
                                  "message": "Only drafts awaiting review can be edited."},
                                 status_code=409)
-        if item.get("kind") == "reply":
+        texting = (item.get("channel") or "email") == "sms"
+        if item.get("kind") == "reply" or texting:
             # Gmail threads a reply by its subject: a new one would land as a
             # fresh, unthreaded email to someone who wrote in. Only the body
             # of a reply is editable; its stored subject is kept exactly.
+            # A text has no subject at all.
             subject = item.get("subject") or ""
-        if not subject.strip() or not text:
+        if texting and not text:
+            return JSONResponse({"success": False, "message": "A text needs some words."},
+                                status_code=400)
+        if not texting and (not subject.strip() or not text):
             return JSONResponse({"success": False,
                                  "message": "Subject and body are both required."},
                                 status_code=400)
@@ -1202,13 +1207,25 @@ async def outbox_edit(item_id: str, request: Request):
         # would block is refused now, while the reviewer can still fix it,
         # instead of failing quietly at send time. Content rules only: the
         # recipient isn't something an edit can change.
-        from harvey.gate import pre_send_check
+        from harvey.gate import pre_send_check, text_content_problems
+        if texting:
+            try:
+                from harvey.config import load_config
+                config = load_config()
+            except Exception:
+                config = None  # links then go unchecked here; the Texter checks again
+            problems = text_content_problems(text, config)
+            if problems:
+                return JSONResponse({"success": False,
+                                     "message": "Harvey would block this text: "
+                                                + "; ".join(problems)},
+                                    status_code=400)
         checked = text
         footer = _compliance_view()["footer"]
         if item.get("kind") == "sequence" and footer and not text.rstrip().endswith(footer):
             checked = text.rstrip() + "\n\n" + footer  # as the Sender will send it
-        gate = pre_send_check("reviewer@example.com", subject, checked)
-        if not gate:
+        gate = None if texting else pre_send_check("reviewer@example.com", subject, checked)
+        if gate is not None and not gate:
             return JSONResponse({"success": False,
                                  "message": "The sender would have blocked this: "
                                             + "; ".join(gate.reasons)},
@@ -1586,7 +1603,7 @@ async def get_conversations(awaiting: bool = False):
             emails.setdefault(e.pop("prospect_id"), []).append(e)
     cids = [r["id"] for r in rows]
     drafts = {d.pop("conversation_id"): d for d in (await query_db(
-        "SELECT id, conversation_id, subject, body, send_at FROM outbox "
+        "SELECT id, conversation_id, subject, body, send_at, channel FROM outbox "
         f"WHERE kind = 'reply' AND status = 'pending_review' AND conversation_id IN ({_in(cids)}) "
         "ORDER BY created_at", tuple(cids)) if cids else [])}
     for row in rows:
@@ -2129,8 +2146,8 @@ async def get_today():
         codes = await state.get_signal_codes()
         proposed = [c for c in codes if c.get("status") == "proposed"]
         confirmed = [c for c in codes if c.get("status") == "confirmed"]
-        pending = await state.get_outbox(status="pending_review", limit=200)
-        approved = await state.get_outbox(status="approved", limit=200)
+        pending = await state.get_outbox(status="pending_review", limit=200, channel=None)
+        approved = await state.get_outbox(status="approved", limit=200, channel=None)
         paused = await state.get_setting("sending_paused")
         counts = await state.count_prospects_by_status()
 
@@ -2278,11 +2295,43 @@ async def get_today():
                 "action": "Read them", "tab": "conversations",
             })
 
+        # Texts through Quo: held (A2P, credits, a rejected key), or from a
+        # number Harvey couldn't match to one person, which it never answers.
+        from harvey.agents.texter import HOLD_KEY as TEXT_HOLD_KEY
+        try:
+            text_hold = json.loads(await state.get_setting(TEXT_HOLD_KEY) or "null")
+        except (json.JSONDecodeError, TypeError):
+            text_hold = None
+        if isinstance(text_hold, dict) and text_hold.get("reason"):
+            items.append({
+                "key": "texts-held", "tone": "bad",
+                "title": "Texts aren't going out",
+                "detail": str(text_hold["reason"])[:300] + " Approved texts wait; Harvey "
+                          "tries again every hour.",
+                "action": "Open the log", "tab": "controls",
+            })
+        unknown_texts = await query_db(
+            "SELECT COUNT(*) AS n FROM actions WHERE action_type = 'text_unknown' "
+            "AND created_at >= datetime('now', '-7 days')")
+        n_unknown = unknown_texts[0]["n"] if unknown_texts else 0
+        if n_unknown:
+            items.append({
+                "key": "texts-unknown", "tone": "warn",
+                "title": (f"{n_unknown} text from a number Harvey doesn't know" if n_unknown == 1
+                          else f"{n_unknown} texts from numbers Harvey doesn't know"),
+                "detail": ("Harvey couldn't match these to one person, so it didn't answer. "
+                           "Read and answer them in Quo."),
+                "action": "Open the log", "tab": "controls",
+            })
+
         if pending:
+            n_texts = sum(1 for p in pending if (p.get("channel") or "email") == "sms")
+            noun = ("text" if n_texts == len(pending) else
+                    "email" if not n_texts else "message")
             items.append({
                 "key": "outbox", "tone": "warn",
-                "title": (f"{len(pending)} email waiting for approval" if len(pending) == 1
-                          else f"{len(pending)} emails waiting for approval"),
+                "title": (f"{len(pending)} {noun} waiting for approval" if len(pending) == 1
+                          else f"{len(pending)} {noun}s waiting for approval"),
                 "detail": ("Nothing sends until you approve it. Read them one at a time."
                            if _require_approval_now() else
                            "Autopilot sends the rest on its own; these wait for you. "

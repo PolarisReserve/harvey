@@ -529,15 +529,19 @@ def cmd_outbox(args):
             print(f"\n  ⚠ SENDING PAUSED: {paused}")
             print("  Resume with: harvey sending resume")
 
-        pending = await state.get_outbox(status="pending_review", limit=50)
-        approved = await state.get_outbox(status="approved", limit=10)
+        pending = await state.get_outbox(status="pending_review", limit=50, channel=None)
+        approved = await state.get_outbox(status="approved", limit=10, channel=None)
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
         print("  " + "=" * 60)
         for item in pending:
-            print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
-                  f"→ {item['to_email']}  (send {item['send_at'][:16]})")
-            print(f"  Subject: {item['subject']}")
+            if (item.get("channel") or "email") == "sms":
+                print(f"\n  [{item['id']}] text → {item['to_phone']}  "
+                      f"(approve each text on its own)")
+            else:
+                print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
+                      f"→ {item['to_email']}  (send {item['send_at'][:16]})")
+                print(f"  Subject: {item['subject']}")
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
                 print(f"    {line}")
@@ -877,6 +881,57 @@ def _warmup_service_check(address: str, warmup):
     return asyncio.run(_run())
 
 
+def cmd_quo(args):
+    """Check the Quo connection, or list the workspace's numbers. Sends nothing."""
+    from dotenv import load_dotenv
+
+    from harvey.config import ConfigError, load_config, load_env
+    from harvey.integrations.quo import QuoClient, QuoError
+    from harvey.paths import PROJECT_ROOT
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    env = load_env()
+    if not env.quo_api_key:
+        print("\n  QUO_API_KEY isn't set. In Quo, open Workspace Settings > API, create a key")
+        print("  for Harvey, and add it to .env as QUO_API_KEY=... (not in a chat).\n")
+        raise SystemExit(1)
+    client = QuoClient(env.quo_api_key)
+
+    async def _run():
+        if args.quo_action == "numbers":
+            try:
+                numbers = await client.phone_numbers()
+            except QuoError as e:
+                print(f"\n  {e}\n")
+                return 1
+            print(f"\n  {len(numbers)} number(s) in this Quo workspace:")
+            for n in numbers:
+                print(f"    {n['number']}  {n['name']}")
+            print("\n  Put the one Harvey should text from in channels.sms.from_number.\n")
+            return 0
+        try:
+            config = load_config()
+        except ConfigError as e:
+            print(f"\n  {e}\n")
+            return 1
+        sms = config.channels.sms
+        ok, detail = await client.test_connection(sms.from_number)
+        print(f"\n  {'OK' if ok else 'Not ready'}: {detail}")
+        try:
+            a2p = await client.a2p_status()
+            print(f"  A2P registration (needed to text US numbers): {a2p}")
+        except QuoError as e:
+            print(f"  A2P registration: couldn't read it ({e})")
+        print(f"  Texting is {'on' if sms.enabled else 'off'} (channels.sms.enabled).")
+        if not sms.enabled:
+            print("  Harvey texts only people who texted your Quo number first or whose")
+            print("  consent you recorded, and every text waits for your approval.")
+        print()
+        return 0 if ok else 1
+
+    raise SystemExit(asyncio.run(_run()))
+
+
 def cmd_trulyinbox(args):
     """Connect TrulyInbox, record another warmup service, or show the status."""
     import getpass
@@ -1134,6 +1189,12 @@ def main():
     sub.add_argument("domain", nargs="?", default="",
                      help="Domain to check (default: your sending mailbox's domain)")
     sub.set_defaults(func=cmd_warmup)
+
+    sub = subparsers.add_parser(
+        "quo", help="Texts through Quo: check the connection, or list your numbers")
+    sub.add_argument("quo_action", nargs="?", default="test", choices=["test", "numbers"],
+                     help="test the key and number (default) or list the workspace's numbers")
+    sub.set_defaults(func=cmd_quo)
 
     sub = subparsers.add_parser(
         "trulyinbox", help="Warmup service: connect TrulyInbox so Harvey can read the inbox rate")

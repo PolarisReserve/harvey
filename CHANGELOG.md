@@ -9,6 +9,23 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Texts through Quo, warm contacts only** (`channels.sms`, `QUO_API_KEY`).
+  Harvey reads texts sent to your Quo number. A text from someone it knows
+  goes through the reply handler like an email: opt-outs, intent,
+  stop-on-reply for their company, hand-offs. The answer is a short text that
+  waits in the Outbox. Every text needs your approval, one at a time, with
+  no autopilot. Harvey texts only people who texted first, recorded in a new
+  consent table. The first text to each number carries "Reply STOP to
+  unsubscribe.", and STOP or any opt-out by text revokes texting consent and
+  opts the person out of email too. Before sending, a text gate checks
+  consent, opt-out, the do-not-contact list, length, links (yours only) and
+  the recipient's daytime, plus `max_daily_texts` and the kill switch. A2P,
+  toll-free verification and credit problems hold texts and show on Today,
+  as do texts from numbers Harvey can't match to one person, which it never
+  answers. Outbox rows now have a channel, and email sending, email caps and
+  the bounce rate read email rows only. `harvey quo test` and
+  `harvey quo numbers` check the setup without sending. See `docs/quo.md`.
+
 - **Company fit and the company register.** The Companies tab now sorts by a
   0-100 fit score worked out from what Harvey already holds: the ICP sector
   match, a contact with a target title, the best email found, and an open

@@ -1669,15 +1669,17 @@ async function loadOutbox() {
 
   list.innerHTML =
     table('Approved &amp; scheduled', data.approved, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['To', r => outboxTo(r)], ['Step', r => r.channel === 'sms' ? 'Text' : r.step],
+      ['Subject', r => r.channel === 'sms' ? (r.body || '').slice(0, 60) : r.subject],
       ['Sends', r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
     ]) +
     table('Recently sent', data.sent, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['To', r => outboxTo(r)], ['Step', r => r.channel === 'sms' ? 'Text' : r.step],
+      ['Subject', r => r.channel === 'sms' ? (r.body || '').slice(0, 60) : r.subject],
       ['Sent', r => formatDate(r.sent_at), true],
     ]) +
     table('Didn\'t send', data.failed, [
-      ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
+      ['To', r => outboxTo(r)], ['Status', r => badge(r.status), false, true],
       ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
     ]);
 }
@@ -1827,6 +1829,11 @@ async function setSendingMode(mode) {
 
 // Why autopilot sent this back for a human (sender: gate.autopilot_review).
 const HELD_PREFIX = 'held for your review: ';   // state.HELD_FOR_REVIEW
+// Who an Outbox row goes to: an email address, or a phone number for a text.
+function outboxTo(r) {
+  return r && r.channel === 'sms' ? (r.to_phone || '') : ((r && r.to_email) || '');
+}
+
 function heldReason(item) {
   const e = String((item && item.error) || '');
   const why = e.startsWith(HELD_PREFIX) ? e.slice(HELD_PREFIX.length) : '';
@@ -1836,14 +1843,15 @@ function heldReason(item) {
 function renderDesk(items, i) {
   const cur = items[i];
   const rail = items.map((it, n) => {
-    const who = it.context && it.context.contact ? it.context.contact : it.to_email;
+    const who = it.context && it.context.contact ? it.context.contact : outboxTo(it);
     const parts = String(who || '').split(/[\s@.]+/);
     return '<div class="desk-item ' + (n === i ? 'active' : '') + '" onclick="deskGo(' + n + ')">' +
       '<span class="avatar">' + initials(parts[0], parts[1]) + '</span>' +
       '<div class="di-text"><div class="to">' + escHtml(who) +
         (heldReason(it) ? ' <span class="tag t-bad" title="Harvey held this instead of sending it">Held</span>' : '') +
         '</div>' +
-      '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div></div>' +
+      '<div class="sub">' + escHtml(it.channel === 'sms' ? 'Text: ' + (it.body || '').slice(0, 50)
+        : (it.subject || '(no subject)')) + '</div></div>' +
     '</div>';
   }).join('');
 
@@ -1852,12 +1860,14 @@ function renderDesk(items, i) {
   // A reply keeps its subject: Gmail threads by it.
   const fixedSubject = cur.kind === 'reply'
     ? ' readonly title="A reply keeps its subject so it stays in the thread"' : '';
+  const texting = cur.channel === 'sms';
   const draft = editing
-    ? '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
-        fixedSubject + ' oninput="deskKeep()">' +
+    ? (texting ? '<input id="desk-subject" type="hidden" value="">'
+        : '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
+        fixedSubject + ' oninput="deskKeep()">') +
       '<textarea id="desk-body" class="desk-edit-body" rows="14" oninput="deskKeep()">' +
         escHtml(unsaved.body) + '</textarea>'
-    : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
+    : (texting ? '' : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>') +
       '<div class="body">' + escHtml(cur.body) + '</div>';
   // Cold email leaves with the footer underneath; show it as it will go out.
   // Not added again when the body already ends with it, as in the Sender.
@@ -1879,8 +1889,8 @@ function renderDesk(items, i) {
   return '<div class="desk">' +
     '<div class="desk-list">' + rail + '</div>' +
     '<div class="desk-pane">' +
-      '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b>' +
-        '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
+      '<div class="to-line">To <b>' + escHtml(outboxTo(cur)) + '</b>' +
+        '<span class="tag">' + (texting ? 'Text' : cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
         '<span class="muted">sends ' + formatDate(cur.send_at) + '</span></div>' +
       renderDeskContext(cur.context) +
       (heldReason(cur)
@@ -1889,6 +1899,9 @@ function renderDesk(items, i) {
           'email can try to steer what Harvey writes.</div></div></div>'
         : '') +
       draft + footer +
+      (texting ? '<div class="muted desk-footer" title="Quo requires it in the first text to each number">' +
+        'Goes out by text from your Quo number. The first text to a number ends with ' +
+        '&ldquo;Reply STOP to unsubscribe.&rdquo;</div>' : '') +
       '<div class="desk-actions">' + actions +
         '<span class="muted" style="font-size:12px;margin-left:auto">' +
           (i + 1) + ' of ' + items.length + '</span>' +
@@ -1922,7 +1935,12 @@ function deskBusy() {
 async function deskSave(id) {
   const subject = document.getElementById('desk-subject').value.trim();
   const body = document.getElementById('desk-body').value.trim();
-  if (!subject || !body) { showToast('Subject and body are both required.', 'error'); return; }
+  const subjectBox = document.getElementById('desk-subject');
+  const texting = subjectBox && subjectBox.type === 'hidden';
+  if (!body || (!texting && !subject)) {
+    showToast(texting ? 'A text needs some words.' : 'Subject and body are both required.', 'error');
+    return;
+  }
   let data = null;
   try {
     const r = await authFetch('/api/outbox/' + encodeURIComponent(id) + '/edit', {
@@ -2564,11 +2582,13 @@ function convoCard(c) {
     }
     const m = it.msg, sent = m.sender === 'harvey';
     return '<div class="thread-msg ' + (sent ? 'sent' : 'received') + '"><div class="sender">' +
-      (sent ? 'Harvey' : escHtml(first)) + ' &middot; ' + relTime(m.timestamp) + '</div>' +
+      (sent ? 'Harvey' : escHtml(first)) + (m.channel === 'sms' ? ' &middot; text' : '') +
+      ' &middot; ' + relTime(m.timestamp) + '</div>' +
       escHtml(m.content) + '</div>';
   }).join('');
   const draft = c.draft
-    ? '<div class="thread-draft"><div class="sender">' + icon('pen') + 'Harvey drafted a reply · waiting for you</div>' +
+    ? '<div class="thread-draft"><div class="sender">' + icon('pen') +
+        (c.draft.channel === 'sms' ? 'Harvey drafted a text' : 'Harvey drafted a reply') + ' · waiting for you</div>' +
       '<div class="td-body">' + escHtml(c.draft.body) + '</div>' +
       '<button class="btn btn-primary btn-sm" onclick="goTab(\'outbox\')">Review in Outbox' + icon('arrow') + '</button></div>'
     : '';

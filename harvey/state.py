@@ -519,6 +519,33 @@ MIGRATIONS: list[str] = [
     -- knows about the recipient. Empty until then.
     ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
     """,
+    # ── v15: texts through Quo, and who agreed to them ──
+    """
+    -- Every outbox row so far is an email. A text has channel 'sms', its
+    -- number in to_phone and an empty to_email; email sending reads only
+    -- channel 'email', so a text can never go out as an email.
+    ALTER TABLE outbox ADD COLUMN channel TEXT DEFAULT 'email';
+    ALTER TABLE outbox ADD COLUMN to_phone TEXT DEFAULT '';
+    CREATE INDEX IF NOT EXISTS idx_outbox_channel_status ON outbox(channel, status);
+
+    -- The record of consent Quo's terms require before the first text to
+    -- anyone. source: inbound_text (they texted first), asked_by_email,
+    -- manual (you recorded it). status: proposed (Harvey found it, you
+    -- haven't confirmed), granted, revoked (STOP, an opt-out, or you).
+    CREATE TABLE IF NOT EXISTS sms_consent (
+        phone TEXT PRIMARY KEY,
+        prospect_id TEXT DEFAULT '',
+        source TEXT DEFAULT '',
+        status TEXT DEFAULT 'proposed',
+        evidence TEXT DEFAULT '',
+        granted_at TIMESTAMP,
+        revoked_at TIMESTAMP,
+        revoke_reason TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_sms_consent_prospect ON sms_consent(prospect_id);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -1010,22 +1037,30 @@ class StateManager:
         thread_ref: str = "",
         in_reply_to: str = "",
         approved_by: str = "",
+        channel: str = "email",
+        to_phone: str = "",
     ) -> str | None:
-        """Queue one outgoing email. Returns its id, or None when the
-        (campaign, prospect, step) slot already exists — the double-send guard.
+        """Queue one outgoing email (or, with channel "sms", a text to
+        ``to_phone``). Returns its id, or None when the (campaign, prospect,
+        step) slot already exists — the double-send guard.
         ``approved_by="autopilot"`` when it's queued approved on autopilot."""
+        if channel not in ("email", "sms"):
+            raise ValueError(f"unknown outbox channel '{channel}'")
+        if channel == "sms" and (to_email or not to_phone):
+            raise ValueError("a text has a phone number and no email address")
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, channel, to_phone)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
+                    channel, (to_phone or "").strip(),
                 ),
             )
             if cursor.rowcount > 0 and approved_by:
@@ -1042,12 +1077,18 @@ class StateManager:
         skip_unready_follow_ups: bool = False,
         kind: str | None = None,
         follow_ups_only: bool = False,
+        channel: str | None = "email",
     ) -> list[dict]:
         """skip_unready_follow_ups: leave out sequence follow-ups whose
         previous step hasn't gone out yet, so they can't fill the page.
         kind: only that kind ("sequence" for cold email).
-        follow_ups_only: only sequence emails after the first step."""
+        follow_ups_only: only sequence emails after the first step.
+        channel: "email" (the default, so email sending never sees a text),
+        "sms", or None for both (the Outbox lists)."""
         where, params = [], []
+        if channel:
+            where.append("COALESCE(o.channel, 'email') = ?")
+            params.append(channel)
         if kind:
             where.append("kind = ?")
             params.append(kind)
@@ -1132,6 +1173,7 @@ class StateManager:
             due = f"({due} OR substr(COALESCE(o.error, ''), 1, ?) = ?)"
             params += [len(moved_back_prefix), moved_back_prefix]
         sql = ("SELECT COUNT(*) FROM outbox o WHERE o.status = 'approved' "
+               "AND COALESCE(o.channel, 'email') = 'email' "
                f"AND o.kind = 'sequence' AND {due} "
                "AND NOT (o.step > 1 AND EXISTS ("
                "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
@@ -1311,9 +1353,11 @@ class StateManager:
             else:
                 # Not the ones autopilot held for a look (possible planted
                 # links or a leak): those are approved one at a time.
+                # Nor texts: each one is approved on its own.
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
                     "updated_at = ? WHERE status = 'pending_review' "
+                    "AND COALESCE(channel, 'email') = 'email' "
                     "AND COALESCE(error, '') NOT LIKE ?",
                     (_utcnow().isoformat(), HELD_FOR_REVIEW + "%"),
                 )
@@ -1422,17 +1466,22 @@ class StateManager:
                 row = await cursor.fetchone()
         return row[0] if row else None
 
-    async def count_outbox_sent(self) -> int:
+    async def count_outbox_sent(self, channel: str = "email") -> int:
+        """Emails sent ever (texts with channel "sms"): the bounce rate's
+        denominator, which a text must not dilute."""
         async with self._connect() as db:
             async with db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE status = 'sent'"
+                "SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
+                "AND COALESCE(channel, 'email') = ?", (channel,)
             ) as cursor:
                 return (await cursor.fetchone())[0]
 
     async def count_outbox_sent_today(self, kind: str | None = None,
-                                      since: str | None = None) -> int:
+                                      since: str | None = None,
+                                      channel: str = "email") -> int:
         """Emails sent today (the UTC day, or since `since`, a naive UTC
-        ISO time); only one kind ("sequence", "reply") if given."""
+        ISO time); only one kind ("sequence", "reply") if given. Texts
+        (channel "sms") are counted apart: they never use an email cap."""
         if since:
             sql = "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND sent_at >= ?"
             params: tuple = (since,)
@@ -1440,6 +1489,8 @@ class StateManager:
             sql = ("SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
                    "AND date(sent_at) = date('now')")
             params = ()
+        sql += " AND COALESCE(channel, 'email') = ?"
+        params += (channel,)
         if kind:
             sql += " AND kind = ?"
             params += (kind,)
@@ -1486,6 +1537,144 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    # ── Texts (Quo): consent and phone lookups ──
+
+    async def get_sms_consent(self, phone: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM sms_consent WHERE phone = ?", ((phone or "").strip(),)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def sms_consents(self, status: str | None = None, limit: int = 200) -> list[dict]:
+        sql, params = "SELECT * FROM sms_consent", []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def grant_sms_consent(self, phone: str, prospect_id: str, source: str,
+                                evidence: str = "") -> bool:
+        """Record that this person agreed to texts. True when consent is now
+        granted. A revoked consent stays revoked: only you can restore it
+        (``source="manual"``), never a later text or email."""
+        phone = (phone or "").strip()
+        if not phone or source not in ("inbound_text", "asked_by_email", "manual"):
+            raise ValueError("consent needs a phone number and a known source")
+        now = _utcnow().isoformat()
+        current = await self.get_sms_consent(phone)
+        if current and current["status"] == "granted":
+            return True
+        if current and current["status"] == "revoked" and source != "manual":
+            return False
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO sms_consent (phone, prospect_id, source, status, evidence, "
+                "granted_at, revoked_at, revoke_reason, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'granted', ?, ?, NULL, '', ?, ?) "
+                "ON CONFLICT(phone) DO UPDATE SET prospect_id = excluded.prospect_id, "
+                "source = excluded.source, status = 'granted', evidence = excluded.evidence, "
+                "granted_at = excluded.granted_at, revoked_at = NULL, revoke_reason = '', "
+                "updated_at = excluded.updated_at",
+                (phone, prospect_id or "", source, (evidence or "")[:500], now, now, now),
+            )
+            await db.commit()
+        return True
+
+    async def revoke_sms_consent(self, *, phone: str = "", prospect_id: str = "",
+                                 reason: str = "") -> int:
+        """No more texts to this number (or every number of this prospect).
+        Cancels their texts still waiting to go out. Returns consents revoked."""
+        if not phone and not prospect_id:
+            return 0
+        now = _utcnow().isoformat()
+        where, params = ("phone = ?", [phone.strip()]) if phone else ("prospect_id = ?", [prospect_id])
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"UPDATE sms_consent SET status = 'revoked', revoked_at = ?, "
+                f"revoke_reason = ?, updated_at = ? WHERE {where} AND status != 'revoked'",
+                (now, (reason or "")[:200], now, *params),
+            )
+            revoked = cursor.rowcount
+            target = "to_phone = ?" if phone else "prospect_id = ?"
+            await db.execute(
+                "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                f"WHERE channel = 'sms' AND {target} "
+                "AND status IN ('pending_review', 'approved')",
+                ("texts stopped: " + (reason or "consent revoked")[:150], now, *params),
+            )
+            await db.commit()
+            return revoked
+
+    async def recent_sent_texts(self, since: str, limit: int = 50) -> list[dict]:
+        """Texts sent since ``since`` (naive UTC ISO), newest first."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE channel = 'sms' AND status = 'sent' "
+                "AND sent_at >= ? ORDER BY sent_at DESC LIMIT ?", (since, int(limit))
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def has_texted(self, phone: str, other_than: str = "") -> bool:
+        """Whether Harvey sent (or is sending) a text to this number, other
+        than the outbox row ``other_than``."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT 1 FROM outbox WHERE channel = 'sms' AND to_phone = ? "
+                "AND status IN ('sent', 'sending') AND id != ? LIMIT 1",
+                ((phone or "").strip(), other_than or ""),
+            ) as cursor:
+                return await cursor.fetchone() is not None
+
+    async def find_prospects_by_phone(self, e164: str, country: str = "CA") -> list[Prospect]:
+        """Who this number belongs to. Recorded consent first, then the
+        prospect's own number, then a company's main line, but only when
+        exactly one person there is in a conversation (a front desk number
+        is shared, and guessing who wrote would answer the wrong person)."""
+        from harvey.phones import normalize_phone
+
+        e164 = normalize_phone(e164, country)
+        if not e164:
+            return []
+        consent = await self.get_sms_consent(e164)
+        if consent and consent.get("prospect_id"):
+            p = await self.get_prospect(consent["prospect_id"])
+            if p is not None:
+                return [p]
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM prospects WHERE COALESCE(phone, '') != ''"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            own = [self._prospect_from_row(r) for r in rows
+                   if normalize_phone(r["phone"], country) == e164]
+            if own:
+                return own
+            async with db.execute(
+                "SELECT id, phone FROM companies WHERE COALESCE(phone, '') != ''"
+            ) as cursor:
+                companies = [r["id"] for r in await cursor.fetchall()
+                             if normalize_phone(r["phone"], country) == e164]
+            if not companies:
+                return []
+            marks = ",".join("?" * len(companies))
+            async with db.execute(
+                f"SELECT DISTINCT p.* FROM prospects p JOIN conversations c "
+                f"ON c.prospect_id = p.id WHERE p.company_id IN ({marks})",
+                companies,
+            ) as cursor:
+                talking = [self._prospect_from_row(r) for r in await cursor.fetchall()]
+        return talking if len(talking) == 1 else []
 
     # ── Signal vocabulary (governed; user-confirmed before collection) ──
 

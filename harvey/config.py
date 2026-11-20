@@ -337,9 +337,54 @@ class LinkedInChannelConfig(BaseModel):
     max_daily_messages: int = 10
 
 
+class SmsChannelConfig(BaseModel):
+    """Texts through Quo (formerly OpenPhone), warm contacts only.
+
+    Harvey texts only someone who agreed to it: they texted the Quo number
+    first, or you recorded their consent. Every text waits in the Outbox for
+    a human, whatever channels.email.require_approval says: there is no
+    autopilot for texts. Needs QUO_API_KEY in .env. See docs/quo.md.
+    """
+    enabled: bool = False
+    provider: str = "quo"
+    # The Quo number Harvey texts from and reads, in E.164 form
+    # ("+12895550100"). Harvey looks up its Quo id on its own.
+    from_number: str = ""
+    max_daily_texts: int = 20
+    # The country a number without a country code is in ("CA", "US").
+    # Empty: compliance.precleared.prospect_country, else CA.
+    default_country: str = ""
+
+    @field_validator("provider")
+    @classmethod
+    def _known_provider(cls, v) -> str:
+        v = str(v or "quo").strip().lower()
+        if v != "quo":
+            raise ValueError(f"'{v}' is not a supported texting provider. Use quo.")
+        return v
+
+    @field_validator("max_daily_texts")
+    @classmethod
+    def _texts_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_daily_texts must be >= 0")
+        return v
+
+    @field_validator("default_country", mode="before")
+    @classmethod
+    def _country(cls, v) -> str:
+        return normalize_prospect_country(v)
+
+
 class ChannelsConfig(BaseModel):
     email: EmailChannelConfig = EmailChannelConfig()
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
+    sms: SmsChannelConfig = SmsChannelConfig()
+
+    @field_validator("sms", mode="before")
+    @classmethod
+    def _blank_sms(cls, v):
+        return SmsChannelConfig() if v is None else v
 
 
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
@@ -758,6 +803,8 @@ class EnvConfig(BaseModel):
     m365_tenant_id: str = ""
     # Optional: only used when compliance.precleared.enabled is true.
     precleared_api_key: str = ""
+    # Optional: only used when channels.sms.enabled is true.
+    quo_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -873,6 +920,7 @@ def load_env() -> EnvConfig:
         m365_client_id=os.getenv("M365_CLIENT_ID", "").strip(),
         m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
+        quo_api_key=os.getenv("QUO_API_KEY", "").strip(),
     )
     return env
 

@@ -14,6 +14,7 @@ def _utcnow() -> datetime:
 class Message(BaseModel):
     sender: str  # "harvey" or "prospect"
     content: str
+    channel: str = "email"  # "email", or "sms" for a text through Quo
     timestamp: datetime = Field(default_factory=_utcnow)
 
 

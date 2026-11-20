@@ -894,6 +894,8 @@ class Sender:
         for item in due:
             if sent >= budget:
                 break
+            if (item.get("channel") or "email") != "email":
+                continue  # a text: only the Texter sends those, through Quo
             if self.cold_only and item["kind"] != "sequence":
                 continue  # quiet hours: replies wait for the operator's hours
             if item["kind"] == "sequence" and sent_cold >= cold_left:

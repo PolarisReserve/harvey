@@ -243,6 +243,84 @@ def pre_send_check(
     return GateResult(ok=not reasons, reasons=reasons)
 
 
+MAX_TEXT_CHARS = 480        # three SMS segments; replies aim for two
+STOP_LINE = "Reply STOP to unsubscribe."
+
+
+def text_content_problems(body: str, config=None) -> list[str]:
+    """What's wrong with a text's words, whoever it goes to. The dashboard
+    checks an edit with this; pre_text_check adds the recipient checks."""
+    reasons: list[str] = []
+    body = (body or "").strip()
+    if not body:
+        reasons.append("empty text")
+    if len(body) > MAX_TEXT_CHARS:
+        reasons.append(f"text too long ({len(body)} > {MAX_TEXT_CHARS} characters)")
+    leftover = MERGE_TAG_RE.findall(body)
+    if leftover:
+        reasons.append(f"unrendered merge tags: {sorted(set(leftover))[:3]}")
+    lowered = body.lower()
+    hits = [p for p in BANNED_PHRASES if p in lowered]
+    if hits:
+        reasons.append(f"banned phrases: {hits[:3]}")
+    if re.search(r"<\s*(html|body|div|table|img|a)\b", body, re.IGNORECASE):
+        reasons.append("HTML markup in text (plain text only)")
+    links = find_links(body)
+    if len(links) > MAX_LINKS:
+        reasons.append(f"too many links ({len(links)} > {MAX_LINKS})")
+    if config is not None:
+        allowed = allowed_link_domains(config)
+        prefix = _booking_prefix(config)
+        foreign = [_shown(host, link, prefix) for host, link in links
+                   if not _is_ours(host, allowed) and not _is_booking_page(link, prefix)]
+        if foreign:
+            reasons.append(f"links somewhere that isn't yours: {sorted(set(foreign))[:3]}")
+    return reasons
+
+
+def pre_text_check(
+    to_phone: str,
+    body: str,
+    *,
+    prospect=None,
+    consent: dict | None = None,
+    config=None,
+    do_not_contact=(),
+    company_domain: str = "",
+) -> GateResult:
+    """Every deterministic check before a text leaves through Quo.
+
+    A text goes only to a number with granted consent (Quo's terms require
+    it before the first message), only to someone who hasn't opted out or
+    been listed do-not-contact, and only plain text with at most one link,
+    and that link yours. Approval doesn't waive any of this.
+    """
+    from harvey.phones import E164_RE
+
+    reasons: list[str] = []
+    to_phone = (to_phone or "").strip()
+    body = (body or "").strip()
+    if not E164_RE.match(to_phone):
+        reasons.append(f"invalid phone number '{to_phone}'")
+    if not consent or consent.get("status") != "granted":
+        state = (consent or {}).get("status") or "none recorded"
+        reasons.append(f"no consent to text this number ({state})")
+    elif consent.get("phone") and consent["phone"] != to_phone:
+        reasons.append("consent is for a different number")
+    if prospect is None:
+        reasons.append("no prospect for this text")
+    else:
+        if (prospect.status or "") == "opted_out":
+            reasons.append("they opted out")
+        listed = (do_not_contact_match(prospect.email or "", do_not_contact)
+                  or do_not_contact_domain_match(company_domain, do_not_contact))
+        if listed:
+            reasons.append(f"'{listed}' is on the do-not-contact list")
+
+    reasons += text_content_problems(body, config)
+    return GateResult(ok=not reasons, reasons=reasons)
+
+
 # ── Autopilot review ──────────────────────────────────────────────────────
 #
 # Websites and the replies people send reach the model, and either can carry

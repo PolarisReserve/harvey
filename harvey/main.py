@@ -47,7 +47,7 @@ CYCLE_TIMEOUT_SECONDS = 600
 QUIET_HOURS_POLL_SECONDS = 300
 
 # Phase-1 tasks that read replies; sending waits for all of them to succeed.
-REPLY_READERS = ("handle_replies", "read_replies")
+REPLY_READERS = ("handle_replies", "read_replies", "read_texts")
 
 
 def in_quiet_hours(config: HarveyConfig) -> bool:
@@ -294,11 +294,13 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.sender import Sender
     from harvey.agents.handler import Handler
     from harvey.agents.analyst import Analyst
+    from harvey.agents.texter import Texter
 
     scout = Scout(brain, state, config, env)
     writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
+    texter = Texter(brain, state, config, env, handler=handler)
     analyst = Analyst(state)
 
     interval = config.usage.heartbeat_interval_minutes * 60
@@ -425,6 +427,15 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 tasks.append(("profile", run_profile_stage(state, limit=25, config=config)))
 
             outcomes = await _run_agents(tasks)
+            # Texts are read after email replies, not alongside them: both
+            # go through the Handler, and one person can write both ways.
+            if texter.sms.enabled:
+                outcomes.update(await _run_agents([("read_texts", texter.read())]))
+                tasks.append(("read_texts", None))
+                # Texts you approved go in the send phase. Not in quiet
+                # hours: like email replies, they wait for your hours.
+                if texter.enabled and not send_only:
+                    send_tasks.append(("send_texts", texter.send))
 
             # Phase 2: send — only after every reply-reading task this cycle
             # finished reading and handling replies (it returns True; a
@@ -441,7 +452,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                         f"Not sending this cycle: {reason} Queued emails wait "
                         "until replies can be read again."
                     )
-                    held = send_hold_reason(unread, paused, getattr(handler, "last_read_problem", ""))
+                    held = send_hold_reason(unread, paused, getattr(handler, "last_read_problem", "")
+                                            or texter.last_read_problem)
                     if held is not None:
                         await record_send_phase(state, held)
                 else:

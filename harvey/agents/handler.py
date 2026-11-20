@@ -51,6 +51,8 @@ INTENT_LABELS = {
 # Intents that get an automated reply. Everything else is closed,
 # deferred, or escalated to a human.
 AUTO_REPLY_INTENTS = {"interested", "objection", "question", "wrong_person"}
+# A text answer stays within two SMS segments (160 characters each).
+SMS_REPLY_CHARS = 300
 # Replies that don't stop the cold email to the rest of their company.
 NO_COMPANY_STOP_INTENTS = {"ooo", "wrong_person"}
 
@@ -659,6 +661,7 @@ class Handler:
 
     async def _record_after_opt_out(
         self, prospect, reply_text: str, campaign_id: str = "", escalate: bool = False,
+        channel: str = "email",
     ):
         """Keep a message from someone who opted out, and do nothing else.
 
@@ -678,8 +681,8 @@ class Handler:
             id="",
             prospect_id=prospect.id,
             campaign_id=campaign_id,
-            channel="email",
-            thread=[Message(sender="prospect", content=reply_text)],
+            channel=channel,
+            thread=[Message(sender="prospect", content=reply_text, channel=channel)],
             intent="escalate" if escalate else "unsubscribe",
             stage="closed_lost",
             status="needs_human" if escalate else "closed",
@@ -712,13 +715,22 @@ class Handler:
         reply_uuid: str,
         campaign_id: str = "",
         reply_meta: dict | None = None,
+        prospect=None,
+        channel: str = "email",
     ):
-        """Classify, record, and respond to a single reply."""
-        # Find the prospect by email (indexed lookup)
-        prospect = await self.state.get_prospect_by_email(lead_email)
+        """Classify, record, and respond to a single reply.
+
+        channel "sms": a text the Texter already matched to ``prospect``.
+        Everything below applies to it as to an email (opt-outs, intent,
+        stop-on-reply, hand-offs); only the answer differs: a short text,
+        queued for your approval through Quo, never sent on its own."""
+        if prospect is None:
+            # Find the prospect by email (indexed lookup)
+            prospect = await self.state.get_prospect_by_email(lead_email)
         if not prospect:
             logger.warning(f"Handler: No prospect found for {lead_email}")
             return
+        texting = channel == "sms"
 
         # Their words, without what we sent them. The keyword checks below
         # read every line they wrote, even under or between quoted lines;
@@ -733,7 +745,8 @@ class Handler:
         escalate = _escalates(keyword_text)
 
         if prospect.status == "opted_out":
-            await self._record_after_opt_out(prospect, reply_text, campaign_id, escalate)
+            await self._record_after_opt_out(prospect, reply_text, campaign_id, escalate,
+                                             channel=channel)
             return
 
         # Update prospect status + stop-on-reply: a human answered, so every
@@ -784,11 +797,11 @@ class Handler:
                 id="",
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
-                channel="email",
+                channel=channel,
                 intent=intent,
                 status="open",
             )
-        convo.thread.append(Message(sender="prospect", content=reply_text))
+        convo.thread.append(Message(sender="prospect", content=reply_text, channel=channel))
         convo.intent = intent
         old_stage = convo.stage
         convo.stage = self._determine_stage(intent, convo.stage, reply_text)
@@ -796,14 +809,15 @@ class Handler:
         # 2b. Draft the reply now, while nothing is stored yet. A held
         # Instantly setup can't send it, so don't spend a model call on it.
         await sync_sending_mode(self.config, self.state)
-        held = not self.is_native and legacy_sending_held(self.config)
+        held = not texting and not self.is_native and legacy_sending_held(self.config)
         # Nothing can be sent to someone on the do-not-contact list, so don't
         # spend a model call drafting; they go to you instead (step 3).
         listed = do_not_contact_match(prospect.email or lead_email,
                                       live_do_not_contact(self.config))
         response = ""
         if intent in AUTO_REPLY_INTENTS and not held and not listed and not handed_off:
-            response = await self._generate_response(intent, reply_text, prospect, convo)
+            response = await self._generate_response(intent, reply_text, prospect, convo,
+                                                     channel=channel)
 
         # 2c. Store the conversation in one write.
         if stored is None:
@@ -935,8 +949,10 @@ class Handler:
             return
 
         # Send the response — natively through the outbox approval ladder,
-        # or immediately via Instantly (legacy).
-        if self.is_native:
+        # or immediately via Instantly (legacy). A text always waits for you.
+        if texting:
+            await self._queue_sms_reply(response, prospect, convo, reply_meta or {}, intent)
+        elif self.is_native:
             await self._queue_native_reply(
                 response, prospect, convo, reply_meta or {}, intent
             )
@@ -1098,6 +1114,42 @@ class Handler:
             await self.state.set_setting(KILL_SWITCH_KEY, reason)
             logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")
 
+    async def _queue_sms_reply(
+        self, response: str, prospect, convo, reply_meta: dict, intent: str
+    ):
+        """Queue Harvey's answer to a text for your approval. Texts have no
+        autopilot: every one waits in the Outbox, whatever require_approval
+        says. The Texter sends it once you approve."""
+        phone = reply_meta.get("phone", "")
+        if not phone:
+            logger.warning("Handler: a text reply had no number to answer. Not queued.")
+            return
+        item_id = await self.state.add_outbox_item(
+            prospect_id=prospect.id,
+            conversation_id=convo.id,
+            kind="reply",
+            channel="sms",
+            to_email="",
+            to_phone=phone,
+            subject="",
+            body=response,
+            send_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            status="pending_review",
+            provider="quo",
+            thread_ref=reply_meta.get("thread_ref", ""),
+            in_reply_to=reply_meta.get("message_id", ""),
+        )
+        if item_id:
+            await self.state.delete_setting(REVIEW_NEXT_REPLY_KEY + prospect.id)
+            logger.info(f"Handler: text reply to {prospect.full_name() or 'a prospect'} "
+                        f"queued for your approval ({intent}).")
+            await self.state.log_action(
+                action_type="reply_queued",
+                agent="handler",
+                details={"prospect_id": prospect.id, "channel": "sms", "intent": intent,
+                         "response_preview": response[:100]},
+            )
+
     async def _queue_native_reply(
         self, response: str, prospect, convo, reply_meta: dict, intent: str
     ):
@@ -1237,7 +1289,8 @@ Respond with ONLY the category label, nothing else."""
         return current_stage
 
     async def _generate_response(
-        self, intent: str, reply_text: str, prospect, convo: Conversation
+        self, intent: str, reply_text: str, prospect, convo: Conversation,
+        channel: str = "email",
     ) -> str:
         """Generate an appropriate response based on intent."""
         history = conversation_history(convo.thread, prospect.full_name())
@@ -1311,7 +1364,17 @@ Write a reply that:"""
 - Makes it easy for them to refer (one-line ask)
 - Under 50 words"""
 
-        prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
+        if channel == "sms":
+            prompt += f"""
+
+THIS IS A TEXT MESSAGE, not an email. They texted you, so answer by text:
+- Under {SMS_REPLY_CHARS} characters, whatever the word limits above say
+- One or two plain sentences, the way a person texts
+- At most one link, and only the booking link if they asked to book
+- No greeting line, no sign-off, no signature, no emoji, no markdown"""
+            prompt += "\n\nWrite ONLY the text message."
+        else:
+            prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
 
         response = await self.brain.think(
             prompt, session_id="harvey-handler",
